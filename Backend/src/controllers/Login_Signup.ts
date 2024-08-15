@@ -3,15 +3,19 @@ import {z} from 'zod';
 import bcrypt from 'bcrypt';
 import dotenv, { parse } from 'dotenv';
 dotenv.config();
-// import { crypto } from 'crypto';
 const crypto = require('crypto');
+import jwt, { Secret } from 'jsonwebtoken';
+
 
 import { PrismaClient } from '@prisma/client';
 import { generateMnemonic, mnemonicToSeedSync } from "bip39";
 import { privateToPublic, bufferToHex } from 'ethereumjs-util';
 import { Wallet } from "ethers";
+import { encryptFunction } from "../middlewares/Encrypt_Decrypt";
 
 const { hdkey } = require('ethereumjs-wallet');
+const secretjwt: string = process.env.JWT_SECRET || '';
+
 
 const prisma = new PrismaClient();
 
@@ -20,27 +24,6 @@ const SignUserSchema = z.object({
     email: z.string().email(),
     password: z.string().min(5)
 })
-
-function encryptPrivateKey(privateKey: any, passphrase: any) {
-    // Derive key from passphrase using PBKDF2
-    const salt = crypto.randomBytes(16);
-    const key = crypto.pbkdf2Sync(passphrase, salt, 100000, 32, 'sha256');
-    
-    // Generate a random IV
-    const iv = crypto.randomBytes(16);
-    
-    // Create cipher with key and IV
-    const cipher = crypto.createCipheriv('aes-256-cbc', key, iv);
-    
-    let encrypted = cipher.update(privateKey.toString(), 'utf8', 'hex');
-    encrypted += cipher.final('hex');
-    
-    // Combine the IV, salt, and the encrypted data (prepend the salt and IV)
-    const ivHex = iv.toString('hex');
-    const saltHex = salt.toString('hex');
-    return `${saltHex}:${ivHex}:${encrypted}`;
-}
-
 
 export const signupUser = async(req: Request, res: Response): Promise<void> => {
     try {
@@ -61,15 +44,6 @@ export const signupUser = async(req: Request, res: Response): Promise<void> => {
 
             const mnemonic = generateMnemonic();
 
-            const response = await prisma.user.create({
-                data: {
-                    username,
-                    email, 
-                    password: hashedPassword,
-                    mnemonic
-                }
-            });
-
             const seed = mnemonicToSeedSync(mnemonic);
             const hdwallet = hdkey.fromMasterSeed(seed);
             const derivationPath = "m/44'/60'/0'/0/0";
@@ -88,7 +62,19 @@ export const signupUser = async(req: Request, res: Response): Promise<void> => {
             const privateKey = private_Key.toString('hex');
 
 
-            const encrypted_PrivateKey = encryptPrivateKey(privateKey, password);
+            const encrypted_PrivateKey = encryptFunction(privateKey, password);
+
+            const encryptedMnemonic = encryptFunction(mnemonic, password);
+
+
+            const response = await prisma.user.create({
+                data: {
+                    username,
+                    email, 
+                    password: hashedPassword,
+                    encryptedMnemonic: encryptedMnemonic
+                }
+            });
 
             const anotherResponse = await prisma.wallet.create({
                 data: {
@@ -102,6 +88,7 @@ export const signupUser = async(req: Request, res: Response): Promise<void> => {
             res.status(200).json({
                 success: true,
                 data: response,
+                anotherData: anotherResponse,
                 message: 'Signed up Successfully'
             })
     }
@@ -110,6 +97,97 @@ export const signupUser = async(req: Request, res: Response): Promise<void> => {
         res.status(500).json({
             success: false,
             message: 'Entry Creation Failed',
+        })
+    }
+}
+
+const UserLoginSchema = z.object({
+    email: z.string().email(),
+    password: z.string().min(5)
+})
+
+export const loginUser = async(req: Request<{ email: string, password: string}>, res: Response): Promise<void> => {
+    try {
+        const parsedInput = UserLoginSchema.safeParse(req.body);
+        if(!parsedInput.success) {
+            res.status(411).json({
+                error: parsedInput.error
+            })
+            return;
+        }
+
+        const email = parsedInput.data.email;
+        const password = parsedInput.data.password;
+
+        const user = await prisma.user.findUnique({
+            where: {
+                email: email,
+            }
+        });
+
+        if(!user) {
+            res.status(404).json({
+                success: false,
+                message: 'User not registered',
+            });
+            return
+        }
+
+        const payload = {
+            email: user.email,
+            name: user.username,
+            id: user.id
+        }
+
+        const compare = await bcrypt.compare(password, user.password);
+
+        if(compare) {
+            const token = jwt.sign({payload}, secretjwt, { expiresIn: "24hr"} )
+
+            res.status(200).json({
+                success: true,
+                data: user,
+                token: token,
+                message: 'Logged in successfully'
+            });
+        } else {
+            res.status(401).json({
+                success: false,
+                message: "Password Incorrect"
+            });
+        }
+    }
+    catch(error) {
+        console.log('Error: ', error)
+        res.status(500).json({
+            success: false,
+            message: 'Cannot Login In',
+        })
+    }
+}
+
+export const logout = async(req: Request, res: Response): Promise<void> => {
+    try {
+        const token = req.headers.authorization?.split(' ')[1] ?? '';
+
+        await prisma.blacklistedtoken.create({
+            data: {
+                token: token,
+                createdAt: new Date()
+            }
+        });
+
+        res.status(200).json({
+            success: true,
+            message: 'User Logged out successfully'
+        })
+
+    }
+    catch(error) {
+        console.log("Error: ", error);
+        res.status(500).json({
+            success: false,
+            message: "Internal server Error"
         })
     }
 }
